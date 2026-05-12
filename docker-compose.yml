@@ -1,0 +1,10 @@
+# Pour tests locaux uniquement. En production, Coolify utilise directement le Dockerfile.
+services:
+  nova:
+    build: .
+    container_name: nova-lada
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    restart: unless-stopped
