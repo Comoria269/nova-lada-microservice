@@ -16,6 +16,7 @@ from threading import Lock
 
 import stripe
 from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
 
 from .auth import require_admin_token
 from .brevo_client import send_template
@@ -62,7 +63,15 @@ app = FastAPI(
     redoc_url=None,
     openapi_url="/openapi.json" if settings.environment != "production" else None,
 )
-
+ # CORS — permet à admin.html (ouvert en local ou ailleurs) d'appeler /admin/*.
+   # Sécurité : les endpoints sont protégés par X-Admin-Token, pas par l'origine.
+app.add_middleware(
+       CORSMiddleware,
+       allow_origins=["*"],
+       allow_methods=["GET", "POST", "OPTIONS"],
+       allow_headers=["*"],
+       allow_credentials=False,
+   )
 
 @app.get("/health", tags=["meta"])
 async def health() -> dict[str, str]:
