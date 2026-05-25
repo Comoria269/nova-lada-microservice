@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     # Admin
     admin_api_token: str
 
+    # Redis (idempotence webhooks)
+    redis_url: str
+
     # Misc
     environment: str = "production"
     log_level: str = "INFO"
