@@ -2,7 +2,7 @@
 NOVA-Lada — Microservice FastAPI pour Lada Vanilia.
 
 Endpoints:
-  GET  /health                          → 200 OK (Coolify healthcheck)
+  GET  /health                          → 200 OK (Coolify healthcheck + état Redis)
   POST /webhook/stripe                  → réception webhook Stripe (signé)
   POST /admin/send-shipping             → déclenchement manuel Template 2
   POST /admin/send-review               → déclenchement manuel Template 3
@@ -10,10 +10,8 @@ Endpoints:
 """
 import logging
 import sys
-from collections import OrderedDict
-from datetime import datetime
-from threading import Lock
 
+import redis
 import stripe
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,23 +33,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("nova-lada")
 
-# ─── Idempotence en mémoire (anti double-envoi) ─────────────────
-# Stripe peut retry un webhook ; on stocke les event_id déjà traités.
-# Capacité bornée pour ne pas saturer la RAM. En cas de redémarrage,
-# Stripe a un mécanisme d'idempotence côté API qui couvre les rejouages.
-_processed_events: "OrderedDict[str, datetime]" = OrderedDict()
-_processed_lock = Lock()
-_PROCESSED_MAX = 5_000
+# ─── Idempotence durable via Redis (anti double-envoi) ──────────
+# Stripe peut renvoyer (retry) un même webhook. On mémorise les
+# event_id déjà traités dans Redis, qui survit aux redémarrages du
+# conteneur (contrairement à une mémoire interne qui serait vidée).
+_redis = redis.from_url(settings.redis_url, decode_responses=True)
+_SEEN_KEY = "nova:seen_events"
+_SEEN_TTL = 7 * 24 * 3600  # 7 jours : au-delà, aucun retry Stripe possible
 
 
 def _seen_event(event_id: str) -> bool:
-    with _processed_lock:
-        if event_id in _processed_events:
-            return True
-        _processed_events[event_id] = datetime.utcnow()
-        if len(_processed_events) > _PROCESSED_MAX:
-            _processed_events.popitem(last=False)
-        return False
+    # SADD renvoie 1 si l'event_id est nouveau, 0 s'il existait déjà.
+    is_new = _redis.sadd(_SEEN_KEY, event_id)
+    _redis.expire(_SEEN_KEY, _SEEN_TTL)
+    return is_new == 0
 
 
 # ─── App FastAPI ────────────────────────────────────────────────
@@ -63,19 +58,33 @@ app = FastAPI(
     redoc_url=None,
     openapi_url="/openapi.json" if settings.environment != "production" else None,
 )
- # CORS — permet à admin.html (ouvert en local ou ailleurs) d'appeler /admin/*.
-   # Sécurité : les endpoints sont protégés par X-Admin-Token, pas par l'origine.
+
+# CORS — permet à admin.html (ouvert en local ou ailleurs) d'appeler /admin/*.
+# Sécurité : les endpoints sont protégés par X-Admin-Token, pas par l'origine.
 app.add_middleware(
-       CORSMiddleware,
-       allow_origins=["*"],
-       allow_methods=["GET", "POST", "OPTIONS"],
-       allow_headers=["*"],
-       allow_credentials=False,
-   )
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    allow_credentials=False,
+)
+
 
 @app.get("/health", tags=["meta"])
-async def health() -> dict[str, str]:
-    return {"status": "ok", "service": "nova-lada", "env": settings.environment}
+async def health() -> dict:
+    # On teste aussi la connexion Redis : utile pour confirmer que
+    # l'idempotence est bien opérationnelle (et pour Uptime Kuma).
+    try:
+        _redis.ping()
+        redis_ok = True
+    except Exception:
+        redis_ok = False
+    return {
+        "status": "ok",
+        "service": "nova-lada",
+        "env": settings.environment,
+        "redis": redis_ok,
+    }
 
 
 @app.get("/admin/ping", tags=["admin"], dependencies=[Depends(require_admin_token)])
@@ -240,4 +249,5 @@ async def send_review(payload: dict) -> dict[str, str]:
         params={"prenom": prenom},
     )
     logger.info("review.sent to=%s", email)
+    return {"status": "sent", "message_id": message_id}
     return {"status": "sent", "message_id": message_id}
